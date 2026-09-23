@@ -1,0 +1,158 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VERSAO_BASE: "1.0"
+
+jobs:
+  # 1) Testes da spec + auditoria de dependências + SonarQube (quality gate bloqueia o deploy)
+  testes-e-seguranca:
+    name: Testes e segurança
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # o Sonar precisa do histórico completo
+
+      - name: Configurar PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, pdo_sqlite, sqlite3
+          coverage: pcov
+
+      - name: Instalar dependências
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Preparar ambiente de testes
+        run: |
+          cp .env.example .env
+          touch database/database.sqlite
+          php artisan key:generate
+
+      - name: Auditoria de dependências (composer audit)
+        run: composer audit --abandoned=report
+
+      - name: Testes de aceitação (CA-01 a CA-11)
+        run: vendor/bin/phpunit --coverage-clover coverage.xml --log-junit junit.xml
+
+      - name: Análise SonarQube Cloud + quality gate
+        uses: SonarSource/sonarqube-scan-action@v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  # 2) Build da imagem Docker e envio para o GitHub Container Registry
+  build:
+    name: Build da imagem
+    needs: testes-e-seguranca
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      imagem: ${{ steps.meta.outputs.imagem }}
+      versao: ${{ steps.meta.outputs.versao }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Definir nome e versão da imagem
+        id: meta
+        run: |
+          echo "imagem=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "versao=v${VERSAO_BASE}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login no ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          build-args: APP_VERSION=${{ steps.meta.outputs.versao }}
+          tags: |
+            ${{ steps.meta.outputs.imagem }}:${{ steps.meta.outputs.versao }}
+            ${{ steps.meta.outputs.imagem }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 3) Deploy na EC2 e publicação da versão
+  deploy:
+    name: Deploy na AWS
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # criar a release
+      packages: read
+    environment:
+      name: producao
+      url: http://${{ vars.EC2_HOST }}
+    env:
+      IMAGEM: ${{ needs.build.outputs.imagem }}:${{ needs.build.outputs.versao }}
+      VERSAO: ${{ needs.build.outputs.versao }}
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configurar chave SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Publicar a nova versão na EC2
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Os segredos vão pelo stdin do SSH, não pela linha de comando
+          {
+            printf 'export IMAGEM=%q\n' "$IMAGEM"
+            printf 'export VERSAO=%q\n' "$VERSAO"
+            printf 'export APP_KEY=%q\n' "$APP_KEY"
+            printf 'export APP_URL=%q\n' "http://$EC2_HOST"
+            printf 'export GHCR_USER=%q\n' "$GITHUB_ACTOR"
+            printf 'export GHCR_TOKEN=%q\n' "$GHCR_TOKEN"
+            cat deploy/deploy.sh
+          } | ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" 'bash -s'
+
+      - name: Conferir a versão publicada pela internet
+        run: |
+          RESPOSTA=$(curl -fsS --retry 10 --retry-delay 3 --retry-all-errors "http://$EC2_HOST/versao")
+          echo "$RESPOSTA"
+          echo "$RESPOSTA" | grep -q "\"versao\":\"$VERSAO\""
+
+      - name: Registrar a release no GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$VERSAO" >/dev/null 2>&1 || \
+          gh release create "$VERSAO" --target "$GITHUB_SHA" --title "$VERSAO" \
+            --notes "Publicada em http://$EC2_HOST pela execução ${GITHUB_RUN_NUMBER}. Imagem: $IMAGEM"
